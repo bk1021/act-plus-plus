@@ -12,20 +12,29 @@ import wandb
 import time
 from torchvision import transforms
 
-from constants import FPS
-from constants import PUPPET_GRIPPER_JOINT_OPEN
+# from constants import FPS
+# from constants import PUPPET_GRIPPER_JOINT_OPEN
 from utils import load_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict, calibrate_linear_vel, postprocess_base_action # helper functions
 from policy import ACTPolicy, CNNMLPPolicy, DiffusionPolicy
-from visualize_episodes import save_videos
+# from visualize_episodes import save_videos
 
 from detr.models.latent_model import Latent_Model_Transformer
 
-from sim_env import BOX_POSE
+# from sim_env import BOX_POSE
 
 import IPython
 e = IPython.embed
+
+# from imitation.utils.robot import Ec66Controller
+from ament_index_python.packages import get_package_share_directory
+import yaml
+
+pkg_dir = get_package_share_directory('imitation')
+config_path = os.path.join(pkg_dir, 'config', 'tasks.yaml')
+with open(config_path, 'r') as f:
+    TASK_CONFIGS = yaml.safe_load(f)
 
 def get_auto_index(dataset_dir):
     max_idx = 1000
@@ -50,25 +59,31 @@ def main(args):
     save_every = args['save_every']
     resume_ckpt_path = args['resume_ckpt_path']
 
-    # get task parameters
-    is_sim = task_name[:4] == 'sim_'
-    if is_sim or task_name == 'all':
-        from constants import SIM_TASK_CONFIGS
-        task_config = SIM_TASK_CONFIGS[task_name]
-    else:
-        from aloha_scripts.constants import TASK_CONFIGS
-        task_config = TASK_CONFIGS[task_name]
+    # # get task parameters
+    # is_sim = task_name[:4] == 'sim_'
+    # if is_sim or task_name == 'all':
+    #     from constants import SIM_TASK_CONFIGS
+    #     task_config = SIM_TASK_CONFIGS[task_name]
+    # else:
+    #     from aloha_scripts.constants import TASK_CONFIGS
+    #     task_config = TASK_CONFIGS[task_name]
+
+    task_config = TASK_CONFIGS["/**"]["ros__parameters"][task_name]
+    
     dataset_dir = task_config['dataset_dir']
+    dataset_dir = os.path.expanduser(dataset_dir)
     # num_episodes = task_config['num_episodes']
-    episode_len = task_config['episode_len']
-    camera_names = task_config['camera_names']
+    episode_len = task_config['eps_len']
+    fps = task_config['fps']
+    start_pose = task_config['start_pose']
+    camera_names = task_config['cam_names']
     stats_dir = task_config.get('stats_dir', None)
     sample_weights = task_config.get('sample_weights', None)
     train_ratio = task_config.get('train_ratio', 0.99)
     name_filter = task_config.get('name_filter', lambda n: True)
 
     # fixed parameters
-    state_dim = 14
+    state_dim = 12
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -89,7 +104,7 @@ def main(args):
                          'vq': args['use_vq'],
                          'vq_class': args['vq_class'],
                          'vq_dim': args['vq_dim'],
-                         'action_dim': 16,
+                         'action_dim': 6,
                          'no_encoder': args['no_encoder'],
                          }
     elif policy_class == 'Diffusion':
@@ -132,10 +147,12 @@ def main(args):
         'onscreen_render': onscreen_render,
         'policy_config': policy_config,
         'task_name': task_name,
+        'start_pose': start_pose,
+        'fps': fps,
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim,
+        # 'real_robot': not is_sim,
         'load_pretrain': args['load_pretrain'],
         'actuator_config': actuator_config,
     }
@@ -145,7 +162,7 @@ def main(args):
     config_path = os.path.join(ckpt_dir, 'config.pkl')
     expr_name = ckpt_dir.split('/')[-1]
     if not is_eval:
-        wandb.init(project="mobile-aloha2", reinit=True, entity="mobile-aloha2", name=expr_name)
+        wandb.init(project="hytron-imitation", reinit='return_previous', entity="jinyou_chan-primech-a-p", name=expr_name)
         wandb.config.update(config)
     with open(config_path, 'wb') as f:
         pickle.dump(config, f)
@@ -203,11 +220,14 @@ def make_optimizer(policy_class, policy):
     return optimizer
 
 
-def get_image(ts, camera_names, rand_crop_resize=False):
+def get_image(obs, camera_names, rand_crop_resize=False):
     curr_images = []
-    for cam_name in camera_names:
-        curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
-        curr_images.append(curr_image)
+    # for cam_name in camera_names:
+    #     curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
+    #     curr_images.append(curr_image)
+    curr_image = rearrange(obs['image'], 'h w c -> c h w')
+    curr_images.append(curr_image)
+
     curr_image = np.stack(curr_images, axis=0)
     curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
 
@@ -229,13 +249,15 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
     set_seed(1000)
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
-    real_robot = config['real_robot']
+    # real_robot = config['real_robot']
     policy_class = config['policy_class']
     onscreen_render = config['onscreen_render']
     policy_config = config['policy_config']
     camera_names = config['camera_names']
     max_timesteps = config['episode_len']
     task_name = config['task_name']
+    start_pose = config['start_pose']
+    fps = config['fps']
     temporal_agg = config['temporal_agg']
     onscreen_cam = 'angle'
     vq = config['policy_config']['vq']
@@ -287,59 +309,65 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
     #         post_processed_actions = post_process(all_actions.squeeze(0).cpu().numpy())
     #         norm_episode_all_base_actions += actuator_norm(post_processed_actions[:, -2:]).tolist()
 
-    pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
+    pre_process = lambda s_state: (s_state - stats['state_mean']) / stats['state_std']
     if policy_class == 'Diffusion':
         post_process = lambda a: ((a + 1) / 2) * (stats['action_max'] - stats['action_min']) + stats['action_min']
     else:
         post_process = lambda a: a * stats['action_std'] + stats['action_mean']
 
-    # load environment
-    if real_robot:
-        from aloha_scripts.robot_utils import move_grippers # requires aloha
-        from aloha_scripts.real_env import make_real_env # requires aloha
-        env = make_real_env(init_node=True, setup_robots=True, setup_base=True)
-        env_max_reward = 0
-    else:
-        from sim_env import make_sim_env
-        env = make_sim_env(task_name)
-        env_max_reward = env.task.max_reward
+    # # load environment
+    # if real_robot:
+    #     from aloha_scripts.robot_utils import move_grippers # requires aloha
+    #     from aloha_scripts.real_env import make_real_env # requires aloha
+    #     env = make_real_env(init_node=True, setup_robots=True, setup_base=True)
+    #     env_max_reward = 0
+    # else:
+    #     from sim_env import make_sim_env
+    #     env = make_sim_env(task_name)
+    #     env_max_reward = env.task.max_reward
+    # ec66 = Ec66Controller()
+    env_max_reward = 0
 
     query_frequency = policy_config['num_queries']
     if temporal_agg:
         query_frequency = 1
         num_queries = policy_config['num_queries']
-    if real_robot:
-        BASE_DELAY = 13
-        query_frequency -= BASE_DELAY
+    # if real_robot:
+    #     BASE_DELAY = 13
+    #     query_frequency -= BASE_DELAY
 
     max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
 
     episode_returns = []
     highest_rewards = []
     for rollout_id in range(num_rollouts):
-        if real_robot:
-            e()
+        # if real_robot:
+        #     e()
+        e()
         rollout_id += 0
         ### set task
-        if 'sim_transfer_cube' in task_name:
-            BOX_POSE[0] = sample_box_pose() # used in sim reset
-        elif 'sim_insertion' in task_name:
-            BOX_POSE[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
+        # if 'sim_transfer_cube' in task_name:
+        #     BOX_POSE[0] = sample_box_pose() # used in sim reset
+        # elif 'sim_insertion' in task_name:
+        #     BOX_POSE[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
 
-        ts = env.reset()
+        # ts = env.reset()
+        # ec66.move_arm_block(start_pose, speed=10)
+        # ec66.reset_transmission()
 
-        ### onscreen render
-        if onscreen_render:
-            ax = plt.subplot()
-            plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
-            plt.ion()
+        # ### onscreen render
+        # if onscreen_render:
+        #     ax = plt.subplot()
+        #     plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
+        #     plt.ion()
 
         ### evaluation loop
         if temporal_agg:
-            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, 16]).cuda()
+            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, 6]).cuda()
 
         # qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
-        qpos_history_raw = np.zeros((max_timesteps, state_dim))
+        qpos_history_raw = np.zeros((max_timesteps, int(state_dim/2)))
+        qvel_history_raw = np.zeros((max_timesteps, int(state_dim/2)))
         image_list = [] # for visualization
         qpos_list = []
         target_qpos_list = []
@@ -348,36 +376,43 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
         #     norm_episode_all_base_actions = [actuator_norm(np.zeros(history_len, 2)).tolist()]
         with torch.inference_mode():
             time0 = time.time()
-            DT = 1 / FPS
+            # DT = 1 / FPS
+            DT = 1 / fps
             culmulated_delay = 0 
             for t in range(max_timesteps):
                 time1 = time.time()
                 ### update onscreen render and wait for DT
-                if onscreen_render:
-                    image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
-                    plt_img.set_data(image)
-                    plt.pause(DT)
+                # if onscreen_render:
+                #     image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
+                #     plt_img.set_data(image)
+                #     plt.pause(DT)
 
                 ### process previous timestep to get qpos and image_list
                 time2 = time.time()
-                obs = ts.observation
-                if 'images' in obs:
-                    image_list.append(obs['images'])
-                else:
-                    image_list.append({'main': obs['image']})
+                # obs = ts.observation
+                # obs = ec66.get_obs()
+                # if 'images' in obs:
+                #     image_list.append(obs['images'])
+                # else:
+                #     image_list.append({'main': obs['image']})
+                image_list.append(obs["image"])
                 qpos_numpy = np.array(obs['qpos'])
+                qvel_numpy = np.array(obs['qvel'])
+                state_numpy = np.concatenate([qpos_numpy, qvel_numpy], axis=-1)
                 qpos_history_raw[t] = qpos_numpy
-                qpos = pre_process(qpos_numpy)
-                qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
+                qvel_history_raw[t] = qvel_numpy
+                state = pre_process(state_numpy)
+                state = torch.from_numpy(state).float().cuda().unsqueeze(0)
                 # qpos_history[:, t] = qpos
                 if t % query_frequency == 0:
-                    curr_image = get_image(ts, camera_names, rand_crop_resize=(config['policy_class'] == 'Diffusion'))
+                    # curr_image = get_image(ts, camera_names, rand_crop_resize=(config['policy_class'] == 'Diffusion'))
+                    curr_image = get_image(obs, camera_names)
                 # print('get image: ', time.time() - time2)
 
                 if t == 0:
                     # warm up
                     for _ in range(10):
-                        policy(qpos, curr_image)
+                        policy(state, curr_image)
                     print('network warm up done')
                     time1 = time.time()
 
@@ -391,14 +426,14 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
                                     vq_sample = latent_model.generate(1, temperature=1, x=None)
                                     print(torch.nonzero(vq_sample[0])[:, 1].cpu().numpy())
                             vq_sample = latent_model.generate(1, temperature=1, x=None)
-                            all_actions = policy(qpos, curr_image, vq_sample=vq_sample)
+                            all_actions = policy(state, curr_image, vq_sample=vq_sample)
                         else:
                             # e()
-                            all_actions = policy(qpos, curr_image)
+                            all_actions = policy(state, curr_image)
                         # if use_actuator_net:
                         #     collect_base_action(all_actions, norm_episode_all_base_actions)
-                        if real_robot:
-                            all_actions = torch.cat([all_actions[:, :-BASE_DELAY, :-2], all_actions[:, BASE_DELAY:, -2:]], dim=2)
+                        # if real_robot:
+                        #     all_actions = torch.cat([all_actions[:, :-BASE_DELAY, :-2], all_actions[:, BASE_DELAY:, -2:]], dim=2)
                     if temporal_agg:
                         all_time_actions[[t], t:t+num_queries] = all_actions
                         actions_for_curr_step = all_time_actions[:, t]
@@ -416,14 +451,14 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
                         #     raw_action[0, -2:] = 0
                 elif config['policy_class'] == "Diffusion":
                     if t % query_frequency == 0:
-                        all_actions = policy(qpos, curr_image)
+                        all_actions = policy(state, curr_image)
                         # if use_actuator_net:
                         #     collect_base_action(all_actions, norm_episode_all_base_actions)
-                        if real_robot:
-                            all_actions = torch.cat([all_actions[:, :-BASE_DELAY, :-2], all_actions[:, BASE_DELAY:, -2:]], dim=2)
+                        # if real_robot:
+                        #     all_actions = torch.cat([all_actions[:, :-BASE_DELAY, :-2], all_actions[:, BASE_DELAY:, -2:]], dim=2)
                     raw_action = all_actions[:, t % query_frequency]
                 elif config['policy_class'] == "CNNMLP":
-                    raw_action = policy(qpos, curr_image)
+                    raw_action = policy(state, curr_image)
                     all_actions = raw_action.unsqueeze(0)
                     # if use_actuator_net:
                     #     collect_base_action(all_actions, norm_episode_all_base_actions)
@@ -435,7 +470,7 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
                 time4 = time.time()
                 raw_action = raw_action.squeeze(0).cpu().numpy()
                 action = post_process(raw_action)
-                target_qpos = action[:-2]
+                target_qpos = action[:-6]
 
                 # if use_actuator_net:
                 #     assert(not temporal_agg)
@@ -454,16 +489,17 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
 
                 ### step the environment
                 time5 = time.time()
-                if real_robot:
-                    ts = env.step(target_qpos, base_action)
-                else:
-                    ts = env.step(target_qpos)
+                # if real_robot:
+                #     ts = env.step(target_qpos, base_action)
+                # else:
+                #     ts = env.step(target_qpos)
+                # ec66.set_joint_pos(target_qpos)
                 # print('step env: ', time.time() - time5)
 
                 ### for visualization
                 qpos_list.append(qpos_numpy)
                 target_qpos_list.append(target_qpos)
-                rewards.append(ts.reward)
+                # rewards.append(ts.reward)
                 duration = time.time() - time1
                 sleep_time = max(0, DT - duration)
                 # print(sleep_time)
@@ -477,22 +513,22 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
 
             print(f'Avg fps {max_timesteps / (time.time() - time0)}')
             plt.close()
-        if real_robot:
-            move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)  # open
-            # save qpos_history_raw
-            log_id = get_auto_index(ckpt_dir)
-            np.save(os.path.join(ckpt_dir, f'qpos_{log_id}.npy'), qpos_history_raw)
-            plt.figure(figsize=(10, 20))
-            # plot qpos_history_raw for each qpos dim using subplots
-            for i in range(state_dim):
-                plt.subplot(state_dim, 1, i+1)
-                plt.plot(qpos_history_raw[:, i])
-                # remove x axis
-                if i != state_dim - 1:
-                    plt.xticks([])
-            plt.tight_layout()
-            plt.savefig(os.path.join(ckpt_dir, f'qpos_{log_id}.png'))
-            plt.close()
+        # if real_robot:
+        #     move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)  # open
+        #     # save qpos_history_raw
+        #     log_id = get_auto_index(ckpt_dir)
+        #     np.save(os.path.join(ckpt_dir, f'qpos_{log_id}.npy'), qpos_history_raw)
+        #     plt.figure(figsize=(10, 20))
+        #     # plot qpos_history_raw for each qpos dim using subplots
+        #     for i in range(state_dim):
+        #         plt.subplot(state_dim, 1, i+1)
+        #         plt.plot(qpos_history_raw[:, i])
+        #         # remove x axis
+        #         if i != state_dim - 1:
+        #             plt.xticks([])
+        #     plt.tight_layout()
+        #     plt.savefig(os.path.join(ckpt_dir, f'qpos_{log_id}.png'))
+        #     plt.close()
 
 
         rewards = np.array(rewards)
@@ -527,9 +563,9 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
 
 
 def forward_pass(data, policy):
-    image_data, qpos_data, action_data, is_pad = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
+    image_data, state_data, action_data, is_pad = data
+    image_data, state_data, action_data, is_pad = image_data.cuda(), state_data.cuda(), action_data.cuda(), is_pad.cuda()
+    return policy(state_data, image_data, action_data, is_pad) # TODO remove None
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -587,14 +623,14 @@ def train_bc(train_dataloader, val_dataloader, config):
                 summary_string += f'{k}: {v.item():.3f} '
             print(summary_string)
                 
-        # evaluation
-        if (step > 0) and (step % eval_every == 0):
-            # first save then eval
-            ckpt_name = f'policy_step_{step}_seed_{seed}.ckpt'
-            ckpt_path = os.path.join(ckpt_dir, ckpt_name)
-            torch.save(policy.serialize(), ckpt_path)
-            success, _ = eval_bc(config, ckpt_name, save_episode=True, num_rollouts=10)
-            wandb.log({'success': success}, step=step)
+        # # evaluation
+        # if (step > 0) and (step % eval_every == 0):
+        #     # first save then eval
+        #     ckpt_name = f'policy_step_{step}_seed_{seed}.ckpt'
+        #     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+        #     torch.save(policy.serialize(), ckpt_path)
+        #     success, _ = eval_bc(config, ckpt_name, save_episode=True, num_rollouts=10)
+        #     wandb.log({'success': success}, step=step)
 
         # training
         policy.train()
