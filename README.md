@@ -90,4 +90,9 @@ If an error of building wheel for `egl_probe` appears when doing robomimic insta
 conda activate aloha
 conda install -y cmake make gxx_linux-64
 ```
+If an error of cannot import `cached_download` from `huggingface_hub` arises, try to downgrade `huggingface_hub`:
+```
+conda activate aloha
+pip install huggingface_hub==0.23.2
+```
 
